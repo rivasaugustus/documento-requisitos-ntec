@@ -3,9 +3,13 @@
 usando o template do NTec (capa, logo, cores e marcadores do ValeDOC).
 
 Uso:
-    python gerar_pdf.py conteudo.md [--saida /mnt/user-data/outputs] [--forcar]
+    python gerar_pdf.py conteudo.md [--saida PASTA] [--forcar]
 
-Formato do markdown: ver seção "Formato do markdown" no SKILL.md.
+Sem --saida, usa /mnt/user-data/outputs se ela existir (claude.ai); senão, a
+pasta do markdown. Precisa do LibreOffice instalado para converter em PDF.
+
+Formato do markdown: ver seção "Formato do markdown" no SKILL.md. O que estiver
+fora desse dialeto é recusado, porque sairia literal no anexo de contrato.
 """
 import argparse
 import os
@@ -15,6 +19,7 @@ import subprocess
 import sys
 import tempfile
 import zipfile
+from pathlib import Path
 from xml.sax.saxutils import escape
 
 AQUI = os.path.dirname(os.path.abspath(__file__))
@@ -27,9 +32,9 @@ NAVY = "1B3A6B"
 MARCADORES_PROIBIDOS = [
     (r"⚠", "símbolo de alerta"),
     (r"(?i)\ba confirmar\b", "'a confirmar'"),
-    # Tags de fonte: o formato do Passo 7 ([Fathom · ...], [Granola · ...], [chat],
-    # [doc: ...]) e o da validação técnica ([AT ...], [Aprof ...]).
-    (r"\[(?:Fathom|Granola|chat\]|doc:|AT\b|Aprof)", "tag de fonte"),
+    # Tags de fonte: o formato do Passo 7 ([Fathom · ...], [Granola · ...],
+    # [transcrição · ...], [chat], [doc: ...]) e o da validação técnica ([AT ...], [Aprof ...]).
+    (r"(?i)\[(?:Fathom|Granola|transcri|chat\]|doc:|AT\b|Aprof)", "tag de fonte"),
     # Sensível a maiúsculas de propósito: "Todo usuário" é palavra inteira em
     # português, então só o limite de palavra não basta para evitar o falso positivo.
     (r"\bTODO\b|\bTBD\b", "pendência (TODO/TBD)"),
@@ -118,16 +123,54 @@ def ler_markdown(caminho):
     for chave in ("projeto", "subtitulo"):
         if not meta.get(chave):
             sys.exit(f"Erro: front matter sem '{chave}'.")
-    return meta, texto[m.end():]
+    # devolve também quantas linhas o front matter ocupa, para as mensagens
+    # de erro apontarem a linha do arquivo, não a do corpo
+    return meta, texto[m.end():], texto[:m.end()].count("\n")
 
 
-def checar_marcadores(corpo):
+def checar_marcadores(corpo, inicio=1):
     achados = []
-    for n, linha in enumerate(corpo.splitlines(), 1):
+    for n, linha in enumerate(corpo.splitlines(), inicio):
         for padrao, nome in MARCADORES_PROIBIDOS:
             if re.search(padrao, linha):
                 achados.append(f"  linha {n}: {nome} → {linha.strip()[:90]}")
     return achados
+
+
+# Sintaxe fora do dialeto. Não há --forcar para isto: asterisco, barra ou
+# cerquilha literal num anexo de contrato nunca é o que se quer.
+SINTAXE_FORA_DO_DIALETO = [
+    (r"^#{4,}", "título com 4+ '#': o dialeto vai até '###'"),
+    (r"^#+[^#\s]", "título sem espaço depois de '#'"),
+    (r"^[*+]\s", "item com '*' ou '+': use '- '"),
+    (r"^\d+[.)]\s", "lista numerada: use '- ' (as Exclusões são numeradas sozinhas)"),
+    (r"^\|", "tabela: não suportada"),
+    (r"^>", "citação com '>': escreva como parágrafo"),
+    (r"^(-{3,}|\*{3,}|_{3,})\s*$", "linha horizontal: não suportada"),
+    (r"`", "crase ou bloco de código: não suportado"),
+    (r"\[[^\]]*\]\([^)]*\)", "link markdown: não suportado"),
+    (r"<[A-Za-z/][^>]*>", "tag HTML: não suportada"),
+    (r"(^|[\s(])_[^_\s][^_]*_(?=$|[\s).,;:!?])", "itálico com '_': não suportado"),
+]
+
+
+def checar_dialeto(corpo, inicio=1):
+    erros = []
+    for n, linha in enumerate(corpo.splitlines(), inicio):
+        if not linha.strip():
+            continue
+        if linha[0] in " \t" and not re.match(r"^(\t| {2,})- ", linha):
+            erros.append(f"  linha {n}: linha indentada que não é sub-item ('  - ') → {linha.strip()[:80]}")
+            continue
+        conteudo = linha.strip()
+        for padrao, nome in SINTAXE_FORA_DO_DIALETO:
+            if re.search(padrao, conteudo):
+                erros.append(f"  linha {n}: {nome} → {conteudo[:80]}")
+        if conteudo.count("**") % 2:
+            erros.append(f"  linha {n}: '**' sem par → {conteudo[:80]}")
+        elif "*" in re.sub(r"\*\*[^*]+\*\*", "", conteudo):
+            erros.append(f"  linha {n}: asterisco solto (itálico não é suportado) → {conteudo[:80]}")
+    return erros
 
 
 def montar_xml(corpo):
@@ -144,7 +187,7 @@ def montar_xml(corpo):
             xml.append(p_h2(linha[3:].strip()))
         elif linha.startswith("### "):
             xml.append(p_h3(linha[4:].strip()))
-        elif re.match(r"^\s{2,}- ", linha):
+        elif re.match(r"^(\t| {2,})- ", linha):
             xml.append(p_bullet(linha.strip()[2:], nivel=1))
         elif linha.startswith("- "):
             xml.append(p_bullet(linha[2:].strip(), numerado=em_exclusoes))
@@ -153,25 +196,39 @@ def montar_xml(corpo):
     return "".join(xml)
 
 
+def localizar_soffice():
+    """Devolve o comando do LibreOffice disponível neste ambiente, ou None."""
+    if os.path.exists(SOFFICE_WRAPPER):  # sandbox do claude.ai
+        return [sys.executable, SOFFICE_WRAPPER]
+    for nome in ("soffice", "libreoffice"):
+        achado = shutil.which(nome)
+        if achado:
+            return [achado]
+    candidatos = [
+        "/Applications/LibreOffice.app/Contents/MacOS/soffice",
+        r"C:\Program Files\LibreOffice\program\soffice.exe",
+        r"C:\Program Files (x86)\LibreOffice\program\soffice.exe",
+    ]
+    for c in candidatos:
+        if os.path.exists(c):
+            return [c]
+    return None
+
+
 def converter_pdf(docx, pasta):
-    cmds = []
-    ultimo = None
-    if os.path.exists(SOFFICE_WRAPPER):
-        cmds.append([sys.executable, SOFFICE_WRAPPER])
-    cmds.append(["soffice"])
-    for base in cmds:
-        try:
-            subprocess.run(
-                base + ["--headless", "--convert-to", "pdf", "--outdir", pasta, docx],
-                check=True, capture_output=True, timeout=180,
-                cwd=os.path.dirname(SOFFICE_WRAPPER) if base[0] == sys.executable else None,
-            )
-            pdf = os.path.splitext(docx)[0] + ".pdf"
-            if os.path.exists(pdf):
-                return pdf
-        except Exception as e:  # tenta o próximo caminho
-            ultimo = e
-    sys.exit(f"Erro na conversão para PDF: {ultimo}")
+    base = localizar_soffice()
+    if base is None:
+        return None
+    try:
+        subprocess.run(
+            base + ["--headless", "--convert-to", "pdf", "--outdir", pasta, docx],
+            check=True, capture_output=True, timeout=180,
+            cwd=os.path.dirname(SOFFICE_WRAPPER) if base[0] == sys.executable else None,
+        )
+    except Exception as e:
+        sys.exit(f"Erro na conversão para PDF ({base[0]}): {e}")
+    pdf = os.path.splitext(docx)[0] + ".pdf"
+    return pdf if os.path.exists(pdf) else None
 
 
 def contar_paginas(pdf):
@@ -179,19 +236,47 @@ def contar_paginas(pdf):
         out = subprocess.run(["pdfinfo", pdf], capture_output=True, text=True).stdout
         return int(re.search(r"Pages:\s+(\d+)", out).group(1))
     except Exception:
+        pass
+    try:
+        from pypdf import PdfReader
+        return len(PdfReader(pdf).pages)
+    except Exception:
+        pass
+    try:
+        dados = open(pdf, "rb").read()
+        return len(re.findall(rb"/Type\s*/Page(?![s\w])", dados)) or None
+    except Exception:
         return None
+
+
+def saida_padrao(markdown):
+    """Pasta que o usuário vê: outputs no claude.ai; senão, a pasta do markdown."""
+    if os.path.isdir("/mnt/user-data/outputs"):
+        return "/mnt/user-data/outputs"
+    return os.path.dirname(os.path.abspath(markdown))
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("markdown")
-    ap.add_argument("--saida", default="/mnt/user-data/outputs")
+    ap.add_argument("--saida", default=None,
+                    help="pasta do PDF (padrão: /mnt/user-data/outputs se existir; senão, a do markdown)")
     ap.add_argument("--forcar", action="store_true",
                     help="gera mesmo com marcadores internos no texto")
     args = ap.parse_args()
 
-    meta, corpo = ler_markdown(args.markdown)
-    achados = checar_marcadores(corpo)
+    meta, corpo, linhas_cabecalho = ler_markdown(args.markdown)
+    inicio = linhas_cabecalho + 1
+    saida = args.saida or saida_padrao(args.markdown)
+
+    erros = checar_dialeto(corpo, inicio)
+    if erros:
+        print("Sintaxe fora do dialeto. Sairia literal no PDF:")
+        print("\n".join(erros))
+        print("Reescreva essas linhas no formato do SKILL.md e rode de novo.")
+        sys.exit(3)
+
+    achados = checar_marcadores(corpo, inicio)
     if achados and not args.forcar:
         print("Marcadores internos encontrados. Documento de contrato não pode levá-los:")
         print("\n".join(achados))
@@ -214,19 +299,28 @@ def main():
                 dados = doc.encode("utf-8")
             zout.writestr(item, dados)
 
+    pasta_md = os.path.dirname(os.path.abspath(args.markdown))
+    # guarda o .docx ao lado do markdown: é sobre ele que se fazem ajustes visuais depois
+    docx_guardado = os.path.join(pasta_md, nome + ".docx")
+    shutil.copy(docx_out, docx_guardado)
+
     pdf = converter_pdf(docx_out, trabalho)
-    os.makedirs(args.saida, exist_ok=True)
-    destino = os.path.join(args.saida, nome + ".pdf")
+    if pdf is None:
+        print("LibreOffice não encontrado neste computador, então o PDF não foi gerado.")
+        print(f"O .docx está em: {docx_guardado}")
+        print("Instale o LibreOffice (libreoffice.org) e rode de novo, ou exporte o .docx para PDF pelo Word.")
+        sys.exit(4)
+
+    os.makedirs(saida, exist_ok=True)
+    destino = os.path.join(saida, nome + ".pdf")
     shutil.copy(pdf, destino)
-    # guarda o .docx ao lado do markdown para a etapa de estilização
-    shutil.copy(docx_out, os.path.join(os.path.dirname(os.path.abspath(args.markdown)), nome + ".docx"))
 
     paginas = contar_paginas(destino)
     print(f"PDF: {destino}")
+    print(f"DOCX: {docx_guardado}")
     print(f"Páginas: {paginas} (inclui a capa)")
     if paginas and paginas > 10:
         print("ATENÇÃO: passou de 10 páginas. Corte densidade (RNs e detalhes de SID), nunca funcionalidade discutida.")
-
 
 if __name__ == "__main__":
     main()
